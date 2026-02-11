@@ -96,6 +96,31 @@ def extract_pos(pgn_path, train_ids, val_ids, test_ids, k=4):
     print(f"  Test:  {len(test_rows)} positions")
     return (pd.DataFrame(train_rows), pd.DataFrame(val_rows), pd.DataFrame(test_rows))
 
+def load_or_extract_positions(pgn_path, train_ids, val_ids, test_ids):
+    """Load positions from parquet files if they exist, otherwise extract and save them."""
+    train_path = Path('data/train_positions.parquet')
+    val_path = Path('data/val_positions.parquet')
+    test_path = Path('data/test_positions.parquet')
+    
+    if train_path.exists() and val_path.exists() and test_path.exists():
+        print("Loading positions from cached parquet files...")
+        train_df = pd.read_parquet(train_path)
+        val_df = pd.read_parquet(val_path)
+        test_df = pd.read_parquet(test_path)
+        print(f"  Train: {len(train_df)} positions")
+        print(f"  Val:   {len(val_df)} positions")
+        print(f"  Test:  {len(test_df)} positions")
+        return (train_df, val_df, test_df)
+    
+    print("Parquet files not found. Extracting positions...")
+    train_df, val_df, test_df = extract_pos(pgn_path, train_ids, val_ids, test_ids)
+    
+    train_df.to_parquet(train_path, index=False)
+    val_df.to_parquet(val_path, index=False)
+    test_df.to_parquet(test_path, index=False)
+    
+    return (train_df, val_df, test_df)
+
 
 
 
@@ -107,7 +132,7 @@ def main():
     game_ids_df = load_games(DB_PATH)
     train_ids, val_ids, test_ids = split_sets(game_ids_df)
 
-    train_df, val_df, test_df = extract_pos(DB_PATH, train_ids, val_ids, test_ids)
+    train_df, val_df, test_df = load_or_extract_positions(DB_PATH, train_ids, val_ids, test_ids)
 
     total_elapsed = time.time() - start_time
     print(f"\nCompleted in {total_elapsed:.2f}s total")
