@@ -8,6 +8,7 @@ dependencies = [
     "matplotlib>=3.10.8",
     "numpy>=2.4.1",
     "pandas>=2.3.3",
+    "pyarrow>=23.0.0",
     "python-chess>=1.999",
     "scikit-learn>=1.8.0",
     "seaborn>=0.13.2",

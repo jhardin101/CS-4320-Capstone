@@ -1,14 +1,48 @@
 from pathlib import Path
-import sqlite3
 import chess.pgn
 import pandas as pd
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 import time
+import os
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "data" / "LumbrasGigaBase_OTB_2025.pgn"
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+# Cache directories for dataframes
+CACHE_DIR = BASE_DIR / "cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+TRAIN_PATH = CACHE_DIR / "train.parquet"
+VAL_PATH = CACHE_DIR / "val.parquet"
+TEST_PATH = CACHE_DIR / "test.parquet"
+
+def cache_exists():
+    return TRAIN_PATH.exists() and VAL_PATH.exists() and TEST_PATH.exists()
+
+def load_cached():
+    return (
+        pd.read_parquet(TRAIN_PATH),
+        pd.read_parquet(VAL_PATH),
+        pd.read_parquet(TEST_PATH)
+    )
+
+def save_cache(train_df, val_df, test_df):
+    train_df.to_parquet(TRAIN_PATH)
+    val_df.to_parquet(VAL_PATH)
+    test_df.to_parquet(TEST_PATH)
+
+def load_or_create_datasets():
+    if cache_exists():
+        return load_cached()
+    
+    print("Preprocessing PGN...")
+    games_df = load_games(DB_PATH)
+    train_ids, val_ids, test_ids = split_sets(games_df)
+    train_df, val_df, test_df = extract_pos(DB_PATH, train_ids, val_ids, test_ids)
+
+    save_cache(train_df, val_df, test_df)
+    return train_df, val_df, test_df
 
 def load_games(pgn_path):
     rows = []
@@ -100,18 +134,11 @@ def extract_pos(pgn_path, train_ids, val_ids, test_ids, k=4):
 
 def main():
     start_time = time.time()
-    
-    game_ids_df = load_games(DB_PATH)
-    train_ids, val_ids, test_ids = split_sets(game_ids_df)
-
-    train_df, val_df, test_df = extract_pos(DB_PATH, train_ids, val_ids, test_ids)
-
-    train_df.to_parquet('data/train_positions.parquet', index=False)
-    val_df.to_parquet('data/val_positions.parquet', index=False)
-    test_df.to_parquet('data/test_positions.parquet', index=False)
+    train_df, val_df, test_df = load_or_create_datasets()
 
     total_elapsed = time.time() - start_time
     print(f"\nCompleted in {total_elapsed:.2f}s total")
+
 
 
 if __name__ == "__main__":
