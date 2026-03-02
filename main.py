@@ -1,10 +1,12 @@
 from pathlib import Path
+from multiprocessing import Pool, cpu_count
 import chess.pgn
 import chess
+import chess.engine
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, GridSearchCV, KFold, validation_curve
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import FunctionTransformer, StandardScaler
 from sklearn.impute import SimpleImputer
@@ -13,6 +15,10 @@ from sklearn.metrics import classification_report, confusion_matrix
 from tqdm import tqdm
 import time
 import os
+import joblib
+import seaborn as sns
+import shutil, stat, sys
+
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "data" / "LumbrasGigaBase_OTB_2025.pgn"
@@ -28,8 +34,31 @@ TRAIN_PATH = CACHE_DIR / "train.parquet"
 VAL_PATH = CACHE_DIR / "val.parquet"
 TEST_PATH = CACHE_DIR / "test.parquet"
 
+# Configuration constants
+ENGINE_PATH = "stockfish"            # or full path to your stockfish binary
+ENGINE_TIME = 0.05                   # seconds per position
+EVAL_CACHE = CACHE_DIR / "engine_evals.parquet"
+MARGIN_CP = 50                       # centipawn margin for "clear" advantage
+MODEL_OUT = CACHE_DIR / "chess_engine_classifier.joblib"
+VALIDATION_CURVE_PNG = CACHE_DIR / "validation_curve.png"
+
 # Classification Macros
 MAX_ITERATIONS = 2000
+
+def find_engine(engine_name_or_path="stockfish"):
+    # prefer absolute path if provided
+    path = engine_name_or_path if os.path.isabs(engine_name_or_path) else (shutil.which(engine_name_or_path) or engine_name_or_path)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Engine not found at '{path}'. Install Stockfish or set ENGINE_PATH to the binary location.")
+    # ensure executable bit
+    if not os.access(path, os.X_OK):
+        try:
+            st = os.stat(path)
+            os.chmod(path, st.st_mode | stat.S_IXUSR)
+        except PermissionError:
+            raise PermissionError(f"Engine binary at '{path}' is not executable. Run: chmod +x {path} or install system-wide.")
+    return path
+
 
 def cache_exists():
     return TRAIN_PATH.exists() and VAL_PATH.exists() and TEST_PATH.exists() and GAMES_PATH.exists()
@@ -160,179 +189,6 @@ def extract_pos(pgn_path, train_ids, val_ids, test_ids, k=4):
     print(f"  Test:  {len(test_rows)} positions")
     return (pd.DataFrame(train_rows), pd.DataFrame(val_rows), pd.DataFrame(test_rows))
 
-# Assignment 4B, Regression
-
-# def prepare_data(df):
-#     """Prepare data by converting to numeric and handling missing values."""
-#     df = df.copy()
-#     df["white_elo"] = pd.to_numeric(df["white_elo"], errors="coerce")
-#     df["black_elo"] = pd.to_numeric(df["black_elo"], errors="coerce")
-    
-#     # Calculate Elo difference (positive = white is higher rated)
-#     df["rating_diff"] = df["white_elo"] - df["black_elo"]
-    
-#     df["result_num"] = df["result"].map({
-#         "1-0": 1.0,
-#         "0-1": 0.0,
-#         "1/2-1/2": 0.5
-#     })
-    
-#     return df
-
-# def create_preprocessing_pipeline():
-#     """Create a preprocessing pipeline with imputation and scaling."""
-#     pipeline = Pipeline([
-#         ('imputer', SimpleImputer(strategy='mean')),
-#         ('scaler', StandardScaler()),
-#         ('regressor', LinearRegression())
-#     ])
-#     return pipeline
-
-# def lin_regress(df):
-#     """Train linear regression model using Elo rating difference as feature."""
-#     df = prepare_data(df)
-    
-#     # Remove rows with missing target and rating_diff
-#     df = df.dropna(subset=['result_num', 'rating_diff'])
-    
-#     # Feature: Elo rating difference
-#     X = df[["rating_diff"]]
-#     y = df["result_num"]
-    
-#     # Create and fit the pipeline
-#     pipeline = create_preprocessing_pipeline()
-#     pipeline.fit(X, y)
-    
-#     # Get predictions
-#     preds = pipeline.predict(X)
-    
-#     return preds, pipeline
-
-
-# def _add_bias_column(X: np.ndarray) -> np.ndarray:
-#     X = np.asarray(X)
-#     if X.ndim == 1:
-#         X = X.reshape(-1, 1)
-#     return np.hstack([np.ones((X.shape[0], 1)), X])
-
-
-# def _predict_weights(X: np.ndarray, w: np.ndarray) -> np.ndarray:
-#     Xb = _add_bias_column(X)
-#     return Xb.dot(w)
-
-
-# def _mse_loss_weights(Xb: np.ndarray, y: np.ndarray, w: np.ndarray) -> float:
-#     return float(np.mean((Xb.dot(w) - y) ** 2))
-
-
-# def _mse_grad_weights(Xb: np.ndarray, y: np.ndarray, w: np.ndarray) -> np.ndarray:
-#     n = Xb.shape[0]
-#     return (2.0 / n) * (Xb.T.dot(Xb.dot(w) - y))
-
-
-# def train_gd(X: np.ndarray, y: np.ndarray, lr: float = 1e-3, epochs: int = 2000, random_state: int = 42):
-#     """Train linear regression with gradient descent on feature matrix X and target y.
-
-#     Returns: weights, losses_list
-#     """
-#     X = np.asarray(X, dtype=float)
-#     y = np.asarray(y, dtype=float)
-#     if X.ndim == 1:
-#         X = X.reshape(-1, 1)
-
-#     Xb = _add_bias_column(X)
-
-#     rng = np.random.default_rng(random_state)
-#     w = rng.normal(0, 0.01, size=(Xb.shape[1],))
-
-#     losses = []
-#     for epoch in range(epochs):
-#         grad = _mse_grad_weights(Xb, y, w)
-#         w = w - lr * grad
-#         losses.append(_mse_loss_weights(Xb, y, w))
-
-#     return w, losses
-
-
-# def visualize_loss(losses, out_path="loss_curve_gd.png"):
-#     plt.figure()
-#     plt.plot(losses, label="train")
-#     plt.xlabel("epoch")
-#     plt.ylabel("MSE")
-#     plt.title("Gradient Descent Training Loss")
-#     plt.legend()
-#     plt.tight_layout()
-#     plt.savefig(out_path, dpi=200)
-#     plt.close()
-
-
-# def lin_regress_gd(df, lr: float = 1e-3, epochs: int = 2000):
-#     """Train using gradient descent on Elo rating difference (single feature).
-
-#     Returns: weights, train_preds, losses
-#     """
-#     df = prepare_data(df)
-#     df = df.dropna(subset=["result_num", "rating_diff"]).copy()
-
-#     X = df[["rating_diff"]].values.astype(float)
-#     y = df["result_num"].values.astype(float)
-
-#     w, losses = train_gd(X, y, lr=lr, epochs=epochs)
-#     preds = _predict_weights(X, w)
-#     return w, preds, losses
-
-# def compute_metrics(y_true, y_pred):
-#     """Compute MSE, RMSE, MAE, and R2 score."""
-#     mse = mean_squared_error(y_true, y_pred)
-#     rmse = np.sqrt(mse)
-#     mae = mean_absolute_error(y_true, y_pred)
-#     r2 = r2_score(y_true, y_pred)
-#     return {'MSE': mse, 'RMSE': rmse, 'MAE': mae, 'R2': r2}
-
-# def visualize_metrics(train_metrics, val_metrics, test_metrics):
-#     """Create comprehensive visualizations for all metrics."""
-#     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-#     fig.suptitle('Model Evaluation Metrics', fontsize=16)
-    
-#     metrics_names = ['MSE', 'RMSE', 'MAE', 'R2']
-    
-#     for idx, (ax, metric) in enumerate(zip(axes.flat, metrics_names)):
-#         datasets = ['Train', 'Val', 'Test']
-#         values = [train_metrics[metric], val_metrics[metric], test_metrics[metric]]
-#         colors = ['#3498db', '#2ecc71', '#e74c3c']
-        
-#         bars = ax.bar(datasets, values, color=colors, alpha=0.7, edgecolor='black')
-#         ax.set_ylabel(metric, fontsize=11)
-#         ax.set_title(f'{metric} Across Datasets', fontsize=12)
-#         ax.grid(axis='y', alpha=0.3)
-        
-#         # Add value labels on bars
-#         for bar, value in zip(bars, values):
-#             height = bar.get_height()
-#             ax.text(bar.get_x() + bar.get_width()/2., height,
-#                     f'{value:.4f}', ha='center', va='bottom', fontsize=10)
-    
-#     plt.tight_layout()
-#     plt.savefig("metrics_comparison.png", dpi=200)
-#     plt.close()
-
-# def print_metrics_summary(train_metrics, val_metrics, test_metrics):
-#     """Print a formatted summary of all metrics."""
-#     print("\n" + "="*70)
-#     print("MODEL EVALUATION METRICS")
-#     print("="*70)
-    
-#     metrics_names = ['MSE', 'RMSE', 'MAE', 'R2']
-#     print(f"{'Metric':<10} {'Train':<15} {'Validation':<15} {'Test':<15}")
-#     print("-"*70)
-    
-#     for metric in metrics_names:
-#         train_val = train_metrics[metric]
-#         val_val = val_metrics[metric]
-#         test_val = test_metrics[metric]
-#         print(f"{metric:<10} {train_val:<15.6f} {val_val:<15.6f} {test_val:<15.6f}")
-    
-#     print("="*70 + "\n")
 
 # Assignment 5B Classification
 def encode_labels(df):
@@ -392,54 +248,222 @@ def make_logistic(max_iter=2000):
         except TypeError:
             # very old sklearn: use defaults
             return LogisticRegression(max_iter=max_iter)
- 
+        
+#Additions in 6B
+
+#Engine evaluation helpers
+def _score_to_cp(score):
+    """Convert chess.engine.Score to centipawn integer from White's perspective."""
+    if score.is_mate():
+        mate = score.mate()
+        return 100000 if mate > 0 else -100000
+    return score.score()
+
+def eval_fen_with_engine_cached(fen, engine, eval_cache):
+    """Evaluate a single FEN using an open engine instance and an in-memory cache dict."""
+    if fen in eval_cache:
+        return eval_cache[fen]
+    board = chess.Board(fen)
+    info = engine.analyse(board, chess.engine.Limit(time=ENGINE_TIME))
+    cp = _score_to_cp(info["score"].white())
+    eval_cache[fen] = cp
+    return cp
+
+def load_eval_cache():
+    if EVAL_CACHE.exists():
+        try:
+            df = pd.read_parquet(EVAL_CACHE)
+            return dict(zip(df["fen"].values, df["eval_cp"].values))
+        except Exception:
+            return {}
+    return {}
+
+def save_eval_cache(eval_cache):
+    df = pd.DataFrame({"fen": list(eval_cache.keys()), "eval_cp": list(eval_cache.values())})
+    df.to_parquet(EVAL_CACHE)
+
+
+def add_engine_labels_df(df, engine_path=ENGINE_PATH, eval_time=ENGINE_TIME, margin=MARGIN_CP, cache=None,
+                         parallel_workers=None, chunk_size=2000, save_every_chunks=5):
+    df = df.copy().reset_index(drop=True)
+    if cache is None:
+        cache = load_eval_cache()
+    # ensure engine exists (but allow fallback to cache-only)
+    try:
+        engine_bin = find_engine(engine_path)
+    except Exception as e:
+        print("Engine not available:", e)
+        print("Using cached evaluations only (rows without cached evals will be dropped).")
+        df["eval_cp"] = df["fen"].map(cache)
+        df = df[df["eval_cp"].notna()].reset_index(drop=True)
+        df = df[df["eval_cp"].abs() > margin].reset_index(drop=True)
+        df["label_engine"] = (df["eval_cp"] > 0).astype(int)
+        return df
+
+    # build list of fens to evaluate (only missing ones)
+    fens = df["fen"].astype(str).tolist()
+    # run parallel evaluator to fill cache for missing fens
+    updated_cache = parallel_evaluate_fens(fens, engine_bin, eval_time=eval_time,
+                                          n_workers=parallel_workers, chunk_size=chunk_size,
+                                          save_every_chunks=save_every_chunks)
+    # attach and filter
+    df["eval_cp"] = df["fen"].map(updated_cache)
+    df = df[df["eval_cp"].notna()].reset_index(drop=True)
+    df = df[df["eval_cp"].abs() > margin].reset_index(drop=True)
+    df["label_engine"] = (df["eval_cp"] > 0).astype(int)
+    return df
 
 
 
+def _score_to_cp(score):
+    if score.is_mate():
+        mate = score.mate()
+        return 100000 if mate > 0 else -100000
+    return score.score()
+
+def _worker_eval_chunk(args):
+    fen_chunk, engine_path, eval_time = args
+    out = {}
+    try:
+        with chess.engine.SimpleEngine.popen_uci(engine_path) as eng:
+            for fen in fen_chunk:
+                try:
+                    info = eng.analyse(chess.Board(fen), chess.engine.Limit(time=eval_time))
+                    out[fen] = _score_to_cp(info["score"].white())
+                except Exception:
+                    out[fen] = 0
+    except Exception:
+        for fen in fen_chunk:
+            out[fen] = 0
+    return out
+
+def chunk_list(lst, size):
+    for i in range(0, len(lst), size):
+        yield lst[i:i+size]
+
+def parallel_evaluate_fens(fen_list, engine_path, eval_time=ENGINE_TIME,
+                           n_workers=None, chunk_size=2000, save_every_chunks=5):
+    if n_workers is None:
+        n_workers = max(1, min(cpu_count() - 1, 4))
+
+    existing = load_eval_cache()
+
+    # Full chunking for global progress
+    full_chunks = list(chunk_list(fen_list, chunk_size))
+    total_chunks = len(full_chunks)
+
+    # Determine missing FENs
+    to_eval = [f for f in fen_list if f not in existing]
+
+    # Chunk only missing FENs
+    missing_chunks = list(chunk_list(to_eval, chunk_size))
+    missing_total = len(missing_chunks)
+
+    # Chunks already satisfied by cache
+    already_done = total_chunks - missing_total
+
+    # If nothing to evaluate, return immediately
+    if missing_total == 0:
+        return existing
+
+    args = [(chunk, engine_path, eval_time) for chunk in missing_chunks]
+    merged = dict(existing)
+
+    try:
+        with Pool(processes=n_workers) as pool:
+            with tqdm(total=total_chunks,
+                      initial=already_done,
+                      desc="Engine eval chunks") as pbar:
+
+                for i, result in enumerate(pool.imap_unordered(_worker_eval_chunk, args), 1):
+                    merged.update(result)
+                    pbar.update(1)
+
+                    if i % save_every_chunks == 0:
+                        save_eval_cache(merged)
+
+    except KeyboardInterrupt:
+        save_eval_cache(merged)
+        raise
+
+    save_eval_cache(merged)
+    return merged
 
 def main():
     start_time = time.time()
     games_df, train_df, val_df, test_df, train_ids, val_ids, test_ids = load_or_create_datasets()
 
-    total_elapsed = time.time() - start_time
-    print(f"\nCompleted in {total_elapsed:.2f}s total")
+    # choose workers and sample strategy here; None uses auto-detected workers
+    WORKERS = None
+    CHUNK_SIZE = 2000
+    SAVE_EVERY_CHUNKS = 5
 
-    train_games = games_df[games_df["game_id"].isin(train_ids)]
-    val_games = games_df[games_df["game_id"].isin(val_ids)]
-    test_games = games_df[games_df["game_id"].isin(test_ids)]
+    print("Annotating train set with engine evaluations (may take time on first run)...")
+    train_df = add_engine_labels_df(train_df, parallel_workers=WORKERS, chunk_size=CHUNK_SIZE, save_every_chunks=SAVE_EVERY_CHUNKS)
+    print("Annotating val set with engine evaluations...")
+    val_df = add_engine_labels_df(val_df, parallel_workers=WORKERS, chunk_size=CHUNK_SIZE, save_every_chunks=SAVE_EVERY_CHUNKS)
+    print("Annotating test set with engine evaluations...")
+    test_df = add_engine_labels_df(test_df, parallel_workers=WORKERS, chunk_size=CHUNK_SIZE, save_every_chunks=SAVE_EVERY_CHUNKS)
 
-    # preprocess
-        #prepare dataframes
-    train_df = encode_labels(train_df)
-    val_df = encode_labels(val_df)
-    test_df = encode_labels(test_df)
 
+    print(f"After margin filter: Train={len(train_df)}, Val={len(val_df)}, Test={len(test_df)}")
+
+    # Prepare features
     X_train = prepare_features(train_df)
-    y_train = train_df['label'].values
+    y_train = train_df["label_engine"].values
     X_val = prepare_features(val_df)
-    y_val = val_df['label'].values
+    y_val = val_df["label_engine"].values
     X_test = prepare_features(test_df)
-    y_test = test_df['label'].values
+    y_test = test_df["label_engine"].values
 
-        #pipeline
+    # Pipeline 
     pipeline = Pipeline([
         ('imputer', SimpleImputer(strategy='mean')),
         ('scaler', StandardScaler()),
-        ('clf', make_logistic(MAX_ITERATIONS))
+        ('clf', LogisticRegression(solver='saga', max_iter=MAX_ITERATIONS, class_weight='balanced', random_state=42))
     ])
-    # Train
-    pipeline.fit(X_train, y_train)
-    y_pred = pipeline.predict(X_val)
-    print(classification_report(y_val, y_pred))
-    print(confusion_matrix(y_val, y_pred))
-    
-    # Evaluation
-    
-    
-    
-   
-    
 
+    # Grid search for regularization strength 
+    param_grid = {"clf__C": [0.01, 0.1, 1, 2, 5, 10, 50, 100]}
+    cv = KFold(n_splits=5, shuffle=True, random_state=42)
+    grid = GridSearchCV(pipeline, param_grid, scoring="f1", cv=cv, n_jobs=-1, return_train_score=True)
+    print("Running GridSearchCV...")
+    grid.fit(X_train, y_train)
+
+    print("Best params:", grid.best_params_)
+    print("Best CV F1:", grid.best_score_)
+
+    # Validation curve plot (train vs val mean F1)
+    C_range = np.array(param_grid["clf__C"])
+    train_scores = grid.cv_results_["mean_train_score"]
+    val_scores = grid.cv_results_["mean_test_score"]
+    # map scores to C order 
+    plt.figure(figsize=(8,5))
+    sns.set_style("whitegrid")
+    plt.semilogx(C_range, train_scores, marker='o', label="Train F1 (mean)")
+    plt.semilogx(C_range, val_scores, marker='o', label="CV F1 (mean)")
+    plt.xlabel("C (log scale)")
+    plt.ylabel("F1 score")
+    plt.title("Validation Curve for clf__C")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(VALIDATION_CURVE_PNG, dpi=200)
+    plt.close()
+
+    # Evaluate best estimator on test set
+    best_model = grid.best_estimator_
+    y_test_pred = best_model.predict(X_test)
+    print("Test classification report:")
+    print(classification_report(y_test, y_test_pred, digits=4))
+    print("Confusion matrix:")
+    print(confusion_matrix(y_test, y_test_pred))
+
+    # Save final model
+    joblib.dump(best_model, MODEL_OUT)
+    elapsed = time.time() - start_time
+    print(f"Training + eval completed in {elapsed:.2f}s. Model saved to {MODEL_OUT}")
+
+    return grid, best_model
 
 
 if __name__ == "__main__":
