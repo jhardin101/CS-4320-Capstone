@@ -6,7 +6,7 @@ import chess.engine
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
-from sklearn.model_selection import train_test_split, GridSearchCV, KFold, validation_curve
+from sklearn.model_selection import train_test_split, GridSearchCV, KFold, validation_curve, StratifiedShuffleSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import FunctionTransformer, StandardScaler
 from sklearn.impute import SimpleImputer
@@ -18,6 +18,12 @@ import os
 import joblib
 import seaborn as sns
 import shutil, stat, sys
+from sklearn.naive_bayes import GaussianNB
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.pipeline import make_pipeline
+
+
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -41,6 +47,12 @@ EVAL_CACHE = CACHE_DIR / "engine_evals.parquet"
 MARGIN_CP = 50                       # centipawn margin for "clear" advantage
 MODEL_OUT = CACHE_DIR / "chess_engine_classifier.joblib"
 VALIDATION_CURVE_PNG = CACHE_DIR / "validation_curve.png"
+RANDOM_STATE = 42
+
+# choose workers and sample strategy here; None uses auto-detected workers
+WORKERS = None
+CHUNK_SIZE = 2000
+SAVE_EVERY_CHUNKS = 5
 
 # Classification Macros
 MAX_ITERATIONS = 2000
@@ -131,8 +143,8 @@ def load_games(pgn_path):
 def split_sets(game_ids_df):
     
 
-    train_ids, temp_ids = train_test_split(game_ids_df, test_size = 0.2, random_state = 42, shuffle = True)
-    val_ids, test_ids = train_test_split(temp_ids, test_size = 0.5, random_state = 42, shuffle = True)
+    train_ids, temp_ids = train_test_split(game_ids_df, test_size = 0.2, random_state = RANDOM_STATE, shuffle = True)
+    val_ids, test_ids = train_test_split(temp_ids, test_size = 0.5, random_state = RANDOM_STATE, shuffle = True)
 
     print("Finished splitting ids.")
 
@@ -389,14 +401,11 @@ def parallel_evaluate_fens(fen_list, engine_path, eval_time=ENGINE_TIME,
     save_eval_cache(merged)
     return merged
 
-def main():
+def log_regress():
     start_time = time.time()
     games_df, train_df, val_df, test_df, train_ids, val_ids, test_ids = load_or_create_datasets()
 
-    # choose workers and sample strategy here; None uses auto-detected workers
-    WORKERS = None
-    CHUNK_SIZE = 2000
-    SAVE_EVERY_CHUNKS = 5
+    
 
     print("Annotating train set with engine evaluations (may take time on first run)...")
     train_df = add_engine_labels_df(train_df, parallel_workers=WORKERS, chunk_size=CHUNK_SIZE, save_every_chunks=SAVE_EVERY_CHUNKS)
@@ -420,12 +429,12 @@ def main():
     pipeline = Pipeline([
         ('imputer', SimpleImputer(strategy='mean')),
         ('scaler', StandardScaler()),
-        ('clf', LogisticRegression(solver='saga', max_iter=MAX_ITERATIONS, class_weight='balanced', random_state=42))
+        ('clf', LogisticRegression(solver='saga', max_iter=MAX_ITERATIONS, class_weight='balanced', random_state=RANDOM_STATE))
     ])
 
     # Grid search for regularization strength 
     param_grid = {"clf__C": [0.01, 0.1, 1, 2, 5, 10, 50, 100]}
-    cv = KFold(n_splits=5, shuffle=True, random_state=42)
+    cv = KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
     grid = GridSearchCV(pipeline, param_grid, scoring="f1", cv=cv, n_jobs=-1, return_train_score=True)
     print("Running GridSearchCV...")
     grid.fit(X_train, y_train)
@@ -465,6 +474,98 @@ def main():
 
     return grid, best_model
 
+def compare_nb_knn_logistic(X_train, y_train, X_val, y_val, X_test, y_test):
+    results = {}
+
+    # Common preprocessing pipeline: imputer + scaler
+    preproc = Pipeline([
+        ('imputer', SimpleImputer(strategy='mean')),
+        ('scaler', StandardScaler())
+    ])
+
+    X_train_p = preproc.fit_transform(X_train)
+    X_val_p = preproc.transform(X_val)
+    X_test_p = preproc.transform(X_test)
+
+    # 1) Gaussian Naive Bayes
+    gnb = GaussianNB()
+    start = time.time()
+    gnb.fit(X_train_p, y_train)
+    train_time = time.time() - start
+    start = time.time()
+    y_pred = gnb.predict(X_test_p)
+    pred_time = (time.time() - start) / len(X_test_p)
+    results['GaussianNB'] = {'model': gnb, 'train_time': train_time, 'pred_time_per_sample': pred_time,
+                             'report': classification_report(y_test, y_pred, output_dict=True)}
+
+    # 2) KNN (grid over k)
+    knn = KNeighborsClassifier()
+    param_grid = {'n_neighbors': [3,5,9], 'weights': ['uniform','distance'], 'metric': ['euclidean','manhattan']}
+    grid = GridSearchCV(knn, param_grid, scoring='f1', cv=3, n_jobs=-1)
+    start = time.time()
+    grid.fit(X_train_p, y_train)
+    train_time = time.time() - start
+    best_knn = grid.best_estimator_
+    start = time.time()
+    y_pred = best_knn.predict(X_test_p)
+    pred_time = (time.time() - start) / len(X_test_p)
+    results['KNN'] = {'model': best_knn, 'train_time': train_time, 'pred_time_per_sample': pred_time,
+                      'best_params': grid.best_params_,
+                      'report': classification_report(y_test, y_pred, output_dict=True)}
+
+    # 3) Logistic 
+    log = LogisticRegression(solver='saga', max_iter=MAX_ITERATIONS, class_weight='balanced', random_state=RANDOM_STATE)
+    start = time.time()
+    log.fit(X_train_p, y_train)
+    train_time = time.time() - start
+    start = time.time()
+    y_pred = log.predict(X_test_p)
+    pred_time = (time.time() - start) / len(X_test_p)
+    results['Logistic'] = {'model': log, 'train_time': train_time, 'pred_time_per_sample': pred_time,
+                           'report': classification_report(y_test, y_pred, output_dict=True)}
+
+    return results
+
+def stratified_sample(df, label_col='label_engine', n=10000, random_state=RANDOM_STATE):
+    n = min(n, len(df))
+    if n == len(df):
+        return df.sample(frac=1, random_state=random_state).reset_index(drop=True)
+    sss = StratifiedShuffleSplit(n_splits=1, train_size=n, random_state=random_state)
+    X = [[i] for i in range(len(df))]
+    y = df[label_col].values
+    idx, _ =next(sss.split(X, y))
+    return df.iloc[idx].reset_index(drop=True)
+
+# Assignment 7 B
+def model_fam_comparison():
+    games_df, train_df, val_df, test_df, train_ids, val_ids, test_ids = load_or_create_datasets()
+
+    
+
+    print("Annotating train set with engine evaluations (may take time on first run)...")
+    train_df = add_engine_labels_df(train_df, parallel_workers=WORKERS, chunk_size=CHUNK_SIZE, save_every_chunks=SAVE_EVERY_CHUNKS)
+    print("Annotating val set with engine evaluations...")
+    val_df = add_engine_labels_df(val_df, parallel_workers=WORKERS, chunk_size=CHUNK_SIZE, save_every_chunks=SAVE_EVERY_CHUNKS)
+    print("Annotating test set with engine evaluations...")
+    test_df = add_engine_labels_df(test_df, parallel_workers=WORKERS, chunk_size=CHUNK_SIZE, save_every_chunks=SAVE_EVERY_CHUNKS)
+
+
+    print(f"After margin filter: Train={len(train_df)}, Val={len(val_df)}, Test={len(test_df)}")
+
+    # Sample a small proxy dataset for testing
+    train_df = stratified_sample(train_df)
+    val_df = stratified_sample(val_df)
+    test_df = stratified_sample(test_df)
+    
+
+    X_train = prepare_features(train_df)
+    y_train = train_df["label_engine"].values
+    X_val = prepare_features(val_df)
+    y_val = val_df["label_engine"].values
+    X_test = prepare_features(test_df)
+    y_test = test_df["label_engine"].values
+
+    print(compare_nb_knn_logistic(X_train, y_train, X_val, y_val, X_test, y_test))
 
 if __name__ == "__main__":
-    main()
+    model_fam_comparison()
