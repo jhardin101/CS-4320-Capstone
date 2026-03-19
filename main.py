@@ -12,6 +12,7 @@ from sklearn.preprocessing import FunctionTransformer, StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.svm import SVC
 from tqdm import tqdm
 import time
 import os
@@ -567,5 +568,74 @@ def model_fam_comparison():
 
     print(compare_nb_knn_logistic(X_train, y_train, X_val, y_val, X_test, y_test))
 
+# Assignment 8 B, SVMs
+def svm_time():
+    games_df, train_df, val_df, test_df, train_ids, val_ids, test_ids = load_or_create_datasets()
+    print("Annotating train set with engine evaluations (may take time on first run)...")
+    train_df = add_engine_labels_df(train_df, parallel_workers=WORKERS, chunk_size=CHUNK_SIZE, save_every_chunks=SAVE_EVERY_CHUNKS)
+    print("Annotating val set with engine evaluations...")
+    val_df = add_engine_labels_df(val_df, parallel_workers=WORKERS, chunk_size=CHUNK_SIZE, save_every_chunks=SAVE_EVERY_CHUNKS)
+    print("Annotating test set with engine evaluations...")
+    test_df = add_engine_labels_df(test_df, parallel_workers=WORKERS, chunk_size=CHUNK_SIZE, save_every_chunks=SAVE_EVERY_CHUNKS)
+
+    print(f"After margin filter: Train={len(train_df)}, Val={len(val_df)}, Test={len(test_df)}")
+
+    # Sample a small proxy dataset for testing
+    train_df = stratified_sample(train_df)
+    val_df = stratified_sample(val_df)
+    test_df = stratified_sample(test_df)
+
+    # Prepare features for training:
+    X_train = prepare_features(train_df)
+    y_train = train_df["label_engine"].values
+    X_val = prepare_features(val_df)
+    y_val = val_df["label_engine"].values
+    X_test = prepare_features(test_df)
+    y_test = test_df["label_engine"].values
+
+    # Pipelines
+    linear = Pipeline([
+        ('imputer', SimpleImputer(strategy="mean")),
+        ("scaler", StandardScaler()),
+        ('clf', SVC(
+            kernel="linear",
+            C=1.0,
+            class_weight='balanced',
+            verbose=1
+        ))
+    ])
+
+    rbf = Pipeline([
+        ('imputer', SimpleImputer(strategy='mean')),
+        ('scaler', StandardScaler()),
+        ('clf', SVC(
+            kernel='rbf',
+            C=1.0,
+            gamma=0.1,
+            class_weight='balanced',
+            verbose=1
+        ))
+    ])
+
+    # Train models
+    linear.fit(X_train, y_train)
+    rbf.fit(X_train, y_train)
+
+    scores_linear = linear.decision_function(X_val)
+    scores_rbf = rbf.decision_function(X_val)
+
+    linear_y_pred = (scores_linear >= 0).astype(int)
+    rbf_y_pred = (scores_rbf >= 0).astype(int)\
+    
+    print("Linear SVM Report: ")
+    print(classification_report(y_val, linear_y_pred, output_dict=True))
+
+    print("RBF SVM Report: ")
+    print(classification_report(y_val, rbf_y_pred, output_dict=True))
+
+
+
+
+
 if __name__ == "__main__":
-    model_fam_comparison()
+    svm_time()
