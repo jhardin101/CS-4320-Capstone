@@ -8,6 +8,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.model_selection import train_test_split, GridSearchCV, KFold, validation_curve, StratifiedShuffleSplit
 from sklearn.pipeline import Pipeline
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
 from sklearn.preprocessing import FunctionTransformer, StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
@@ -633,9 +635,95 @@ def svm_time():
     print("RBF SVM Report: ")
     print(classification_report(y_val, rbf_y_pred, output_dict=True))
 
+# Assignment 9 B: Ensembles
+def fetch_dataframes():
+    games_df, train_df, val_df, test_df, train_ids, val_ids, test_ids = load_or_create_datasets()
+    print("Annotating train set with engine evaluations (may take time on first run)...")
+    train_df = add_engine_labels_df(train_df, parallel_workers=WORKERS, chunk_size=CHUNK_SIZE, save_every_chunks=SAVE_EVERY_CHUNKS)
+    print("Annotating val set with engine evaluations...")
+    val_df = add_engine_labels_df(val_df, parallel_workers=WORKERS, chunk_size=CHUNK_SIZE, save_every_chunks=SAVE_EVERY_CHUNKS)
+    print("Annotating test set with engine evaluations...")
+    test_df = add_engine_labels_df(test_df, parallel_workers=WORKERS, chunk_size=CHUNK_SIZE, save_every_chunks=SAVE_EVERY_CHUNKS)
+
+    print(f"After margin filter: Train={len(train_df)}, Val={len(val_df)}, Test={len(test_df)}")
+    return train_df, val_df, test_df
+
+def ensemble_tests():
+    train_df, val_df, test_df = fetch_dataframes()
+
+    # Sample a small proxy dataset for testing
+    train_df = stratified_sample(train_df,n=50000)
+    val_df = stratified_sample(val_df, n=50000)
+    test_df = stratified_sample(test_df, n=50000)
+
+    # Prepare features for training:
+    X_train = prepare_features(train_df)
+    y_train = train_df["label_engine"].values
+    X_val = prepare_features(val_df)
+    y_val = val_df["label_engine"].values
+    X_test = prepare_features(test_df)
+    y_test = test_df["label_engine"].values
+
+    # Pipelines and Preprocessing
+    tree_preprocess = Pipeline([
+        ("imputer", SimpleImputer(strategy="median"))
+    ])
+
+    # Baseline Tree : high variance, instructive failures
+    tree_pipeline = Pipeline([
+        ("preprocess", tree_preprocess),
+        ("clf", DecisionTreeClassifier(
+            max_depth=None,
+            min_samples_leaf=5,
+            class_weight="balanced",
+            random_state=RANDOM_STATE
+        ))
+    ])
+
+    # Random Forest
+    rf_pipeline = Pipeline([
+        ("preprocess", tree_preprocess),
+        ("clf", RandomForestClassifier(
+            n_estimators=200,
+            max_depth=None,
+            min_samples_leaf=5,
+            n_jobs=1,
+            class_weight="balanced",
+            random_state=RANDOM_STATE
+        ))
+    ])
+
+    # Histogram-based Gradient Boosting
+    hgb_pipeline = Pipeline([
+        ("preprocess", tree_preprocess),
+        ("clf", HistGradientBoostingClassifier(
+            max_depth=6,
+            learning_rate=0.1,
+            max_iter=200,
+            random_state=RANDOM_STATE
+        ))
+    ])
+
+    # Evaluation
+    models = {
+        "Decision Tree": tree_pipeline,
+        "Random Forest": rf_pipeline,
+        "HistGradientBoosting": hgb_pipeline
+    }
+
+    for name, model in models.items():
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_val)
+        print(f"\n{name}")
+        print(classification_report(y_val, y_pred, digits=4))
+
+
+    
+  
+
 
 
 
 
 if __name__ == "__main__":
-    svm_time()
+    ensemble_tests()
