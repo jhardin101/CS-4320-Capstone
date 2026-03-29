@@ -13,7 +13,7 @@ from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassif
 from sklearn.preprocessing import FunctionTransformer, StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import classification_report, confusion_matrix, silhouette_score
 from sklearn.svm import SVC
 from tqdm import tqdm
 import time
@@ -25,7 +25,8 @@ from sklearn.naive_bayes import GaussianNB
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.pipeline import make_pipeline
-
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
 
 
 
@@ -717,6 +718,69 @@ def ensemble_tests():
         print(f"\n{name}")
         print(classification_report(y_val, y_pred, digits=4))
 
+# Assignment 10 Part B: Unsupervised Learning
+def unsupervised_tests():
+    # retrieve dataframes
+    train_df, _, _ = fetch_dataframes()
+    train_df = prepare_features(train_df)
+
+    # Make proxy dataset for faster tests
+    n = min(10000, len(train_df))
+    train_df = train_df.sample(n=n, random_state=RANDOM_STATE).reset_index(drop=True)
+    
+    
+    preprocess = Pipeline(steps=[ 
+                ("imputer", SimpleImputer(strategy="median")), 
+                ("scaler", StandardScaler()) 
+                ])
+    X_proc = preprocess.fit_transform(train_df)
+
+    # Explained Variance
+    pca_full = PCA()
+    pca_full.fit(X_proc)
+
+    explained_var = pca_full.explained_variance_ratio_
+    c_var = np.cumsum(explained_var)
+
+    for i in range(11):
+        print(f"PC{i+1}: {explained_var[i]:.3f}, cumulative: {c_var[i]: .3f}")
+
+    # 2D PCA Vis
+    pca = PCA(n_components=2, random_state=RANDOM_STATE)
+    X_2d = pca.fit_transform(X_proc)
+
+    plt.figure(figsize=(7,6))
+    plt.scatter(X_2d[:, 0], X_2d[:, 1], alpha=0.5)
+    plt.xlabel("PC1")
+    plt.ylabel("PC2")
+    plt.title("PCA Projection (2D)")
+    plt.savefig("pca.png", dpi=300, bbox_inches="tight")
+    plt.show()
+    
+    # K Means
+    results = []
+    ks = [2,3,4,5,6,7,8,9,10]
+
+    for k in ks:
+        kmeans = KMeans(n_clusters=k, random_state=RANDOM_STATE, n_init=10)
+        labels = kmeans.fit_predict(X_proc)
+
+        inertia = kmeans.inertia_
+        sil = silhouette_score(X_proc, labels)
+
+        results.append((k, inertia, sil))
+        print(f"k={k}: inertia={inertia:.1f}, silhouette={sil:.3f}")
+   
+    # Final Model
+    k_final = 2
+    kmeans = KMeans(n_clusters=k_final, random_state=RANDOM_STATE, n_init=10)
+    labels = kmeans.fit_predict(X_proc)
+
+    X_labeled = train_df.copy()
+    X_labeled["cluster"] = labels
+
+    cluster_summary = X_labeled.groupby("cluster").mean(numeric_only=True)
+    print(cluster_summary)
 
     
   
@@ -726,4 +790,4 @@ def ensemble_tests():
 
 
 if __name__ == "__main__":
-    ensemble_tests()
+    unsupervised_tests()
