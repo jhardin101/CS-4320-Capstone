@@ -782,6 +782,204 @@ def unsupervised_tests():
     cluster_summary = X_labeled.groupby("cluster").mean(numeric_only=True)
     print(cluster_summary)
 
+# Assignment 11 Part B: Neural Networks (MLP Proxy)
+
+def fetch_dataframes():
+    """Load cached or create train/val/test dataframes with engine labels."""
+    games_df, train_df, val_df, test_df, train_ids, val_ids, test_ids = load_or_create_datasets()
+    
+    print("Annotating train set with engine evaluations...")
+    train_df = add_engine_labels_df(train_df, parallel_workers=WORKERS, 
+                                    chunk_size=CHUNK_SIZE, save_every_chunks=SAVE_EVERY_CHUNKS)
+    print("Annotating val set with engine evaluations...")
+    val_df = add_engine_labels_df(val_df, parallel_workers=WORKERS, 
+                                  chunk_size=CHUNK_SIZE, save_every_chunks=SAVE_EVERY_CHUNKS)
+    print("Annotating test set with engine evaluations...")
+    test_df = add_engine_labels_df(test_df, parallel_workers=WORKERS, 
+                                   chunk_size=CHUNK_SIZE, save_every_chunks=SAVE_EVERY_CHUNKS)
+    
+    print(f"After margin filter: Train={len(train_df)}, Val={len(val_df)}, Test={len(test_df)}")
+    return train_df, val_df, test_df
+
+def mlp_neural_proxy():
+    """
+    MLP proxy comparison against GBM baseline.
+    
+    Approach: Uses hand-engineered features (10 dims) to train an MLP
+    and compares performance to existing HistGradientBoosting baseline (F1=0.7802).
+    
+    Research question: Does MLP add non-linear benefit over GBM for this task?
+    """
+    start_time = time.time()
+    
+    # Load datasets
+    train_df, val_df, test_df = fetch_dataframes()
+    
+    # Prepare features (same hand-engineered features used for GBM)
+    print("\nPreparing features...")
+    X_train = prepare_features(train_df)
+    y_train = train_df["label_engine"].values
+    
+    X_val = prepare_features(val_df)
+    y_val = val_df["label_engine"].values
+    
+    X_test = prepare_features(test_df)
+    y_test = test_df["label_engine"].values
+    
+    print(f"Feature shapes: X_train={X_train.shape}, X_val={X_val.shape}, X_test={X_test.shape}")
+    print(f"Class distribution: y_train={np.bincount(y_train.astype(int))}")
+    
+    # === Baseline: HistGradientBoosting (from Assignment 6 Part B) ===
+    print("\n" + "="*70)
+    print("BASELINE: HistGradientBoosting Classifier")
+    print("="*70)
+    
+    tree_preprocess = Pipeline([
+        ('imputer', SimpleImputer(strategy='mean')),
+        ('scaler', StandardScaler()),
+    ])
+    
+    hgb_pipeline = Pipeline([
+        ("preprocess", tree_preprocess),
+        ("clf", HistGradientBoostingClassifier(
+            max_depth=6,
+            learning_rate=0.1,
+            max_iter=200,
+            random_state=RANDOM_STATE
+        ))
+    ])
+    
+    hgb_pipeline.fit(X_train, y_train)
+    y_pred_hgb = hgb_pipeline.predict(X_test)
+    y_pred_proba_hgb = hgb_pipeline.predict_proba(X_test)[:, 1]
+    
+    print("HGB TEST SET RESULTS:")
+    print(classification_report(y_test, y_pred_hgb, digits=4))
+    
+    # === MLP Neural Network ===
+    print("\n" + "="*70)
+    print("PROPOSED: Multi-Layer Perceptron (MLP)")
+    print("="*70)
+    
+    from sklearn.neural_network import MLPClassifier
+    from sklearn.preprocessing import StandardScaler as Scaler
+    
+    # Preprocessing for MLP
+    scaler = Scaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_val_scaled = scaler.transform(X_val)
+    X_test_scaled = scaler.transform(X_test)
+    
+    # MLP with early stopping via validation set
+    mlp = MLPClassifier(
+        hidden_layer_sizes=(128, 64),           # 2 hidden layers: 128 and 64 neurons
+        max_iter=1000,
+        learning_rate_init=0.001,
+        early_stopping=True,
+        validation_fraction=0.1,                # Use 10% of training for early stop
+        n_iter_no_change=50,                    # Stop if no improvement for 50 iterations
+        batch_size=32,
+        random_state=RANDOM_STATE,
+        verbose=1
+    )
+    
+    print("Training MLP with early stopping...")
+    mlp.fit(X_train_scaled, y_train)
+    
+    print(f"Training stopped at iteration: {mlp.n_iter_}")
+    print(f"Loss history length: {len(mlp.loss_curve_)}")
+    
+    # Predictions
+    y_pred_mlp = mlp.predict(X_test_scaled)
+    y_pred_proba_mlp = mlp.predict_proba(X_test_scaled)[:, 1]
+    
+    print("MLP TEST SET RESULTS:")
+    print(classification_report(y_test, y_pred_mlp, digits=4))
+    
+    # === Comparison ===
+    print("\n" + "="*70)
+    print("COMPARISON: MLP vs. HistGradientBoosting")
+    print("="*70)
+    
+    from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score
+    
+    metrics = {}
+    for name, y_pred, y_proba in [
+        ("HistGradientBoosting", y_pred_hgb, y_pred_proba_hgb),
+        ("MLP", y_pred_mlp, y_pred_proba_mlp)
+    ]:
+        metrics[name] = {
+            "precision": precision_score(y_test, y_pred, zero_division=0),
+            "recall": recall_score(y_test, y_pred, zero_division=0),
+            "f1": f1_score(y_test, y_pred, zero_division=0),
+            "roc_auc": roc_auc_score(y_test, y_proba)
+        }
+    
+    comparison_df = pd.DataFrame(metrics).T
+    print("\nComparison Table:")
+    print(comparison_df.to_string())
+    
+    # Save comparison
+    comparison_df.to_csv(CACHE_DIR / "mlp_vs_baseline.csv")
+    
+    # === Visualization ===
+    print("\nGenerating comparison visualization...")
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # Confusion matrices
+    from sklearn.metrics import confusion_matrix
+    cm_hgb = confusion_matrix(y_test, y_pred_hgb)
+    cm_mlp = confusion_matrix(y_test, y_pred_mlp)
+    
+    sns.heatmap(cm_hgb, annot=True, fmt='d', cmap='Blues', ax=axes[0], cbar=False)
+    axes[0].set_title("HistGradientBoosting\nConfusion Matrix")
+    axes[0].set_ylabel("Actual")
+    axes[0].set_xlabel("Predicted")
+    
+    sns.heatmap(cm_mlp, annot=True, fmt='d', cmap='Blues', ax=axes[1], cbar=False)
+    axes[1].set_title("MLP\nConfusion Matrix")
+    axes[1].set_ylabel("Actual")
+    axes[1].set_xlabel("Predicted")
+    
+    plt.tight_layout()
+    plt.savefig(CACHE_DIR / "mlp_comparison.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    # Learning curve
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(mlp.loss_curve_, marker='o', markersize=3, label='MLP Training Loss')
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("Loss")
+    ax.set_title("MLP Learning Curve (with Early Stopping)")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(CACHE_DIR / "mlp_learning_curve.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    # === Summary ===
+    elapsed = time.time() - start_time
+    print("\n" + "="*70)
+    print("SUMMARY")
+    print("="*70)
+    print(f"\nFeasibility Assessment:")
+    print(f"  GBM Baseline F1: {metrics['HistGradientBoosting']['f1']:.4f}")
+    print(f"  MLP F1:          {metrics['MLP']['f1']:.4f}")
+    f1_diff = metrics['MLP']['f1'] - metrics['HistGradientBoosting']['f1']
+    print(f"  Difference:      {f1_diff:+.4f}")
+    
+    if f1_diff > 0.01:
+        print(f"\n  ✓ MLP shows improvement. Consider adopting for next iteration.")
+    elif f1_diff > -0.01:
+        print(f"\n  ≈ MLP performance matches GBM. No significant advantage.")
+        print(f"    Recommendation: Continue with GBM (simpler, faster, interpretable).")
+    else:
+        print(f"\n  ✗ MLP underperforms GBM. Conclusion: Non-linearity not needed here.")
+        print(f"    Recommendation: Stick with GBM; hand-engineered features capture signal well.")
+    
+    print(f"\nTraining time: {elapsed:.2f}s")
+    print(f"Visualizations saved to {CACHE_DIR}/")
+
     
   
 
@@ -790,4 +988,4 @@ def unsupervised_tests():
 
 
 if __name__ == "__main__":
-    unsupervised_tests()
+    mlp_neural_proxy()
