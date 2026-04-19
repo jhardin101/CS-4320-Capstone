@@ -13,7 +13,7 @@ from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassif
 from sklearn.preprocessing import FunctionTransformer, StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import classification_report, confusion_matrix, silhouette_score
+from sklearn.metrics import classification_report, confusion_matrix, silhouette_score, precision_score, recall_score, f1_score, roc_auc_score
 from sklearn.svm import SVC
 from tqdm import tqdm
 import time
@@ -27,6 +27,10 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.pipeline import make_pipeline
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
 
 
 
@@ -980,12 +984,374 @@ def mlp_neural_proxy():
     print(f"\nTraining time: {elapsed:.2f}s")
     print(f"Visualizations saved to {CACHE_DIR}/")
 
+# Assignment 12 B
+
+
+def fen_to_board_tensor(fen, device='cpu'):
+    """
+    Convert FEN string to 12-channel 8x8 tensor (one channel per piece type × color).
+    """
+    board = chess.Board(fen)
+    board_array = np.zeros((12, 8, 8), dtype=np.float32)
     
-  
+    piece_to_channel = {
+        'P': 0, 'N': 1, 'B': 2, 'R': 3, 'Q': 4, 'K': 5,
+    }
+    
+    for square in chess.SQUARES:
+        piece = board.piece_at(square)
+        if piece is not None:
+            rank, file = divmod(square, 8)
+            piece_char = piece.symbol().upper()
+            channel = piece_to_channel[piece_char]
+            
+            if not piece.color:
+                channel += 6
+            
+            board_array[channel, 7 - rank, file] = 1.0
+    
+    tensor = torch.from_numpy(board_array).unsqueeze(0).to(device)
+    return tensor
 
+def fen_list_to_tensors(fen_list, device='cpu'):
+    """Convert list of FENs to batch tensor."""
+    tensors = []
+    for fen in tqdm(fen_list, desc="Converting FENs to tensors", disable=len(fen_list)<1000):
+        tensors.append(fen_to_board_tensor(fen, device=device).squeeze(0))
+    return torch.stack(tensors)
 
+class ChessCNN(nn.Module):
+    """Lightweight CNN for chess position classification."""
+    def __init__(self, input_channels=12, num_classes=2):
+        super(ChessCNN, self).__init__()
+        
+        self.conv1 = nn.Conv2d(input_channels, 32, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(32)
+        self.relu1 = nn.ReLU()
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+        
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.relu2 = nn.ReLU()
+        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+        
+        self.fc1 = nn.Linear(64 * 2 * 2, 128)
+        self.relu_fc = nn.ReLU()
+        self.dropout = nn.Dropout(0.5)
+        self.fc2 = nn.Linear(128, num_classes)
+    
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu1(x)
+        x = self.pool1(x)
+        
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = self.relu2(x)
+        x = self.pool2(x)
+        
+        x = x.view(x.size(0), -1)
+        
+        x = self.fc1(x)
+        x = self.relu_fc(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        
+        return x
 
-
+def train_cnn():
+    """Train CNN and compare to GBM baseline."""
+    start_time = time.time()
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    print("\nLoading datasets...")
+    train_df, val_df, test_df = fetch_dataframes()
+    
+    print("\nConverting board positions to tensors...")
+    X_train_tensor = fen_list_to_tensors(train_df['fen'].values.tolist(), device=device)
+    X_val_tensor = fen_list_to_tensors(val_df['fen'].values.tolist(), device=device)
+    X_test_tensor = fen_list_to_tensors(test_df['fen'].values.tolist(), device=device)
+    
+    y_train = torch.from_numpy(train_df['label_engine'].values).long().to(device)
+    y_val = torch.from_numpy(val_df['label_engine'].values).long().to(device)
+    y_test = torch.from_numpy(test_df['label_engine'].values).long().to(device)
+    
+    print(f"Train tensor shape: {X_train_tensor.shape}")
+    print(f"Val tensor shape:   {X_val_tensor.shape}")
+    print(f"Test tensor shape:  {X_test_tensor.shape}")
+    print(f"Class distribution (train): {torch.bincount(y_train)}")
+    
+    train_dataset = TensorDataset(X_train_tensor, y_train)
+    val_dataset = TensorDataset(X_val_tensor, y_val)
+    test_dataset = TensorDataset(X_test_tensor, y_test)
+    
+    batch_size = 64
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    
+    print(f"\nDataLoaders created: batch_size={batch_size}")
+    print(f"  Train batches: {len(train_loader)}")
+    print(f"  Val batches:   {len(val_loader)}")
+    print(f"  Test batches:  {len(test_loader)}")
+    
+    print("\n" + "="*70)
+    print("BASELINE: HistGradientBoosting Classifier (Hand-Engineered Features)")
+    print("="*70)
+    
+    X_train_feat = prepare_features(train_df)
+    X_val_feat = prepare_features(val_df)
+    X_test_feat = prepare_features(test_df)
+    
+    y_train_np = train_df["label_engine"].values
+    y_val_np = val_df["label_engine"].values
+    y_test_np = test_df["label_engine"].values
+    
+    tree_preprocess = Pipeline([
+        ('imputer', SimpleImputer(strategy='mean')),
+        ('scaler', StandardScaler()),
+    ])
+    
+    hgb_pipeline = Pipeline([
+        ("preprocess", tree_preprocess),
+        ("clf", HistGradientBoostingClassifier(
+            max_depth=6,
+            learning_rate=0.1,
+            max_iter=200,
+            random_state=RANDOM_STATE
+        ))
+    ])
+    
+    print("Training HistGradientBoosting...")
+    hgb_pipeline.fit(X_train_feat, y_train_np)
+    y_pred_hgb = hgb_pipeline.predict(X_test_feat)
+    y_pred_proba_hgb = hgb_pipeline.predict_proba(X_test_feat)[:, 1]
+    
+    print("\nHistGradientBoosting Test Results:")
+    print(classification_report(y_test_np, y_pred_hgb, digits=4))
+    
+    print("\n" + "="*70)
+    print("PROPOSED: Convolutional Neural Network (Raw Board Representation)")
+    print("="*70)
+    
+    model = ChessCNN(input_channels=12, num_classes=2).to(device)
+    print(f"\nModel architecture:")
+    print(model)
+    
+    criterion = nn.CrossEntropyLoss(weight=torch.tensor([1.0, 1.0], device=device))
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+    
+    best_val_loss = float('inf')
+    patience = 10
+    patience_counter = 0
+    
+    max_epochs = 100
+    train_losses = []
+    val_losses = []
+    
+    print(f"\nTraining CNN for up to {max_epochs} epochs...")
+    
+    for epoch in range(max_epochs):
+        model.train()
+        train_loss = 0.0
+        train_correct = 0
+        train_total = 0
+        
+        for inputs, labels in train_loader:
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item() * inputs.size(0)
+            _, predicted = torch.max(outputs.data, 1)
+            train_total += labels.size(0)
+            train_correct += (predicted == labels).sum().item()
+        
+        train_loss /= train_total
+        train_acc = train_correct / train_total
+        train_losses.append(train_loss)
+        
+        model.eval()
+        val_loss = 0.0
+        val_correct = 0
+        val_total = 0
+        
+        with torch.no_grad():
+            for inputs, labels in val_loader:
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+                
+                val_loss += loss.item() * inputs.size(0)
+                _, predicted = torch.max(outputs.data, 1)
+                val_total += labels.size(0)
+                val_correct += (predicted == labels).sum().item()
+        
+        val_loss /= val_total
+        val_acc = val_correct / val_total
+        val_losses.append(val_loss)
+        
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            print(f"Epoch {epoch+1:3d} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | "
+                  f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
+        
+        scheduler.step(val_loss)
+        
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            torch.save(model.state_dict(), CACHE_DIR / "cnn_best_model.pt")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"\nEarly stopping triggered at epoch {epoch+1}")
+                break
+    
+    model.load_state_dict(torch.load(CACHE_DIR / "cnn_best_model.pt"))
+    
+    print("\n" + "="*70)
+    print("CNN TEST SET EVALUATION")
+    print("="*70)
+    
+    model.eval()
+    y_pred_cnn = []
+    y_pred_proba_cnn = []
+    
+    with torch.no_grad():
+        for inputs, labels in test_loader:
+            outputs = model(inputs)
+            probs = torch.softmax(outputs, dim=1)
+            _, predicted = torch.max(outputs.data, 1)
+            y_pred_cnn.extend(predicted.cpu().numpy())
+            y_pred_proba_cnn.extend(probs[:, 1].cpu().numpy())
+    
+    y_pred_cnn = np.array(y_pred_cnn)
+    y_pred_proba_cnn = np.array(y_pred_proba_cnn)
+    
+    print("\nCNN Test Results:")
+    print(classification_report(y_test_np, y_pred_cnn, digits=4))
+    
+    print("\n" + "="*70)
+    print("COMPARISON: CNN (Raw Board) vs. HistGradientBoosting (Hand-Engineered)")
+    print("="*70)
+    
+    metrics_cnn = {
+        "precision": precision_score(y_test_np, y_pred_cnn, zero_division=0),
+        "recall": recall_score(y_test_np, y_pred_cnn, zero_division=0),
+        "f1": f1_score(y_test_np, y_pred_cnn, zero_division=0),
+        "roc_auc": roc_auc_score(y_test_np, y_pred_proba_cnn)
+    }
+    
+    metrics_hgb = {
+        "precision": precision_score(y_test_np, y_pred_hgb, zero_division=0),
+        "recall": recall_score(y_test_np, y_pred_hgb, zero_division=0),
+        "f1": f1_score(y_test_np, y_pred_hgb, zero_division=0),
+        "roc_auc": roc_auc_score(y_test_np, y_pred_proba_hgb)
+    }
+    
+    comparison_df = pd.DataFrame({
+        "HistGradientBoosting": metrics_hgb,
+        "CNN (Raw Board)": metrics_cnn
+    })
+    
+    comparison_df["Difference (CNN - HGB)"] = comparison_df["CNN (Raw Board)"] - comparison_df["HistGradientBoosting"]
+    
+    print("\nComparison Table:")
+    print(comparison_df.to_string())
+    
+    comparison_df.to_csv(CACHE_DIR / "cnn_vs_baseline.csv")
+    print(f"\nComparison saved to {CACHE_DIR / 'cnn_vs_baseline.csv'}")
+    
+    print("\nGenerating visualizations...")
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(train_losses, marker='o', markersize=3, label='Training Loss', alpha=0.7)
+    ax.plot(val_losses, marker='s', markersize=3, label='Validation Loss', alpha=0.7)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.set_title("CNN Learning Curves (Training vs. Validation)")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(CACHE_DIR / "cnn_learning_curves.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    cm_hgb = confusion_matrix(y_test_np, y_pred_hgb)
+    cm_cnn = confusion_matrix(y_test_np, y_pred_cnn)
+    
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    sns.heatmap(cm_hgb, annot=True, fmt='d', cmap='Blues', ax=axes[0], cbar=False)
+    axes[0].set_title("HistGradientBoosting\n(Hand-Engineered Features)")
+    axes[0].set_ylabel("Actual")
+    axes[0].set_xlabel("Predicted")
+    
+    sns.heatmap(cm_cnn, annot=True, fmt='d', cmap='Greens', ax=axes[1], cbar=False)
+    axes[1].set_title("CNN\n(Raw 8×8 Board)")
+    axes[1].set_ylabel("Actual")
+    axes[1].set_xlabel("Predicted")
+    
+    plt.tight_layout()
+    plt.savefig(CACHE_DIR / "cnn_confusion_matrices.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    x = np.arange(4)
+    width = 0.35
+    
+    metrics_to_plot = ["precision", "recall", "f1", "roc_auc"]
+    hgb_vals = [metrics_hgb[m] for m in metrics_to_plot]
+    cnn_vals = [metrics_cnn[m] for m in metrics_to_plot]
+    
+    ax.bar(x - width/2, hgb_vals, width, label='HGB (Hand-Engineered)', alpha=0.8)
+    ax.bar(x + width/2, cnn_vals, width, label='CNN (Raw Board)', alpha=0.8)
+    
+    ax.set_ylabel('Score')
+    ax.set_title('Model Comparison: Metrics')
+    ax.set_xticks(x)
+    ax.set_xticklabels(metrics_to_plot)
+    ax.legend()
+    ax.grid(True, alpha=0.3, axis='y')
+    plt.tight_layout()
+    plt.savefig(CACHE_DIR / "cnn_metrics_comparison.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    elapsed = time.time() - start_time
+    
+    print("\n" + "="*70)
+    print("SUMMARY")
+    print("="*70)
+    print(f"\nCNN F1 Score:           {metrics_cnn['f1']:.4f}")
+    print(f"HGB F1 Score:           {metrics_hgb['f1']:.4f}")
+    print(f"Difference:             {metrics_cnn['f1'] - metrics_hgb['f1']:+.4f}")
+    print(f"\nCNN ROC-AUC:            {metrics_cnn['roc_auc']:.4f}")
+    print(f"HGB ROC-AUC:            {metrics_hgb['roc_auc']:.4f}")
+    print(f"Difference:             {metrics_cnn['roc_auc'] - metrics_hgb['roc_auc']:+.4f}")
+    
+    print(f"\nTraining completed in {elapsed:.2f}s")
+    print(f"Outputs saved to {CACHE_DIR}/")
+    print(f"  - cnn_vs_baseline.csv")
+    print(f"  - cnn_learning_curves.png")
+    print(f"  - cnn_confusion_matrices.png")
+    print(f"  - cnn_metrics_comparison.png")
+    print(f"  - cnn_best_model.pt (PyTorch model weights)")
+    
+    return {
+        "model": model,
+        "metrics_cnn": metrics_cnn,
+        "metrics_hgb": metrics_hgb,
+        "comparison_df": comparison_df,
+        "train_losses": train_losses,
+        "val_losses": val_losses,
+        "y_pred_cnn": y_pred_cnn,
+        "y_pred_hgb": y_pred_hgb
+    }
 
 if __name__ == "__main__":
-    mlp_neural_proxy()
+    train_cnn()
+
